@@ -1,0 +1,1071 @@
+import React, { useState, useEffect, createContext, useContext } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import {
+  getFirestore, collection, doc, getDocs, getDoc,
+  addDoc, setDoc, updateDoc, deleteDoc, query, where,
+  onSnapshot
+} from 'firebase/firestore';
+
+// Pastikan library XLSX dimuat dari CDN untuk import/export Excel di browser
+// Ini akan ditambahkan di HTML induk oleh Canvas.
+// <script src="https://unpkg.com/xlsx/dist/xlsx.full.min.js"></script>
+
+// --- KONSTANTA & CONFIG ---
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// ADMIN UID: Ganti ini dengan UID admin sesungguhnya jika Anda memiliki sistem registrasi user
+// Untuk demo ini, kita akan mengasumsikan UID admin adalah sebuah string yang diketahui.
+// Anda bisa mendapatkan UID setelah user login dan menampilkannya di UI.
+// Contoh: const ADMIN_UID = "some-firebase-user-id-for-admin";
+// Untuk demo ini, saya akan membuatnya fleksibel, jika ada token awal, admin adalah user itu.
+// Jika tidak, admin adalah user anonim pertama yang login.
+let ADMIN_UID = null; // Akan diisi setelah autentikasi
+
+// --- Context untuk Autentikasi dan Firestore ---
+const AppContext = createContext(null);
+
+const AppProvider = ({ children }) => {
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [loadingFirebase, setLoadingFirebase] = useState(true);
+
+  useEffect(() => {
+    const initFirebase = async () => {
+      try {
+        const app = initializeApp(firebaseConfig);
+        const firestore = getFirestore(app);
+        const firebaseAuth = getAuth(app);
+
+        setDb(firestore);
+        setAuth(firebaseAuth);
+
+        // Sign in with custom token or anonymously
+        if (initialAuthToken) {
+          await signInWithCustomToken(firebaseAuth, initialAuthToken);
+        } else {
+          await signInAnonymously(firebaseAuth);
+        }
+
+        const unsubscribe = onAuthStateChanged(firebaseAuth, (user) => {
+          if (user) {
+            setUserId(user.uid);
+            // Untuk demo, user pertama yang login adalah admin
+            if (!ADMIN_UID) {
+              ADMIN_UID = user.uid; // Tetapkan user yang login pertama sebagai admin
+            }
+            setIsAdmin(user.uid === ADMIN_UID);
+          } else {
+            setUserId(null);
+            setIsAdmin(false);
+          }
+          setLoadingFirebase(false);
+        });
+
+        return () => unsubscribe(); // Cleanup on unmount
+      } catch (error) {
+        console.error("Error initializing Firebase:", error);
+        setLoadingFirebase(false);
+        // Tampilkan pesan error ke user jika diperlukan
+      }
+    };
+
+    initFirebase();
+  }, []);
+
+  return (
+    <AppContext.Provider value={{ db, auth, userId, isAdmin, loadingFirebase, ADMIN_UID }}>
+      {children}
+    </AppContext.Provider>
+  );
+};
+
+// --- Komponen Pesan ---
+const Message = ({ text, type }) => {
+  if (!text) return null;
+  const baseClasses = "p-3 rounded-md font-semibold text-center";
+  let typeClasses = "";
+  switch (type) {
+    case "error":
+      typeClasses = "bg-red-100 text-red-700 border border-red-400";
+      break;
+    case "success":
+      typeClasses = "bg-green-100 text-green-700 border border-green-400";
+      break;
+    case "info":
+      typeClasses = "bg-blue-100 text-blue-700 border border-blue-400";
+      break;
+    default:
+      typeClasses = "bg-gray-100 text-gray-700 border border-gray-300";
+  }
+  return <p className={`${baseClasses} ${typeClasses} mt-4`}>{text}</p>;
+};
+
+// --- Komponen Halaman Siswa ---
+const StudentView = () => {
+  const { db, loadingFirebase } = useContext(AppContext);
+  const [nisn, setNisn] = useState('');
+  const [studentData, setStudentData] = useState(null);
+  const [message, setMessage] = useState({ text: '', type: '' });
+  const [loading, setLoading] = useState(false);
+
+  const searchStudent = async () => {
+    setMessage({ text: '', type: '' });
+    setStudentData(null);
+    if (!nisn.trim()) {
+      setMessage({ text: 'Mohon masukkan NISN untuk mencari.', type: 'error' });
+      return;
+    }
+    setLoading(true);
+    setMessage({ text: 'Mencari data...', type: 'info' });
+
+    try {
+      const studentsRef = collection(db, `artifacts/${appId}/public/data/students`);
+      const q = query(studentsRef, where('nisn', '==', nisn.trim()));
+      const querySnapshot = await getDocs(q);
+
+      if (querySnapshot.empty) {
+        setMessage({ text: `Data siswa dengan NISN "${nisn}" tidak ditemukan.`, type: 'error' });
+        setLoading(false);
+        return;
+      }
+
+      const studentDoc = querySnapshot.docs[0];
+      const student = { id: studentDoc.id, ...studentDoc.data() };
+
+      const gradesRef = collection(db, `artifacts/${appId}/public/data/grades`);
+      const gradesQ = query(gradesRef, where('siswaId', '==', student.id));
+      const gradesSnapshot = await getDocs(gradesQ);
+
+      const gradesData = [];
+      for (const gradeDoc of gradesSnapshot.docs) {
+        const grade = gradeDoc.data();
+        const subjectDoc = await getDoc(doc(db, `artifacts/${appId}/public/data/subjects`, grade.mapelId));
+        gradesData.push({
+          ...grade,
+          mata_pelajaran: subjectDoc.exists() ? subjectDoc.data().nama_mapel : 'Tidak Dikenal'
+        });
+      }
+
+      setStudentData({ ...student, nilai_pas: gradesData });
+      setMessage({ text: '', type: '' });
+    } catch (error) {
+      console.error("Error searching student:", error);
+      setMessage({ text: 'Terjadi kesalahan saat mencari data.', type: 'error' });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (loadingFirebase) {
+    return <div className="min-h-screen flex items-center justify-center bg-gray-100"><p className="text-xl font-semibold text-blue-600">Memuat Firebase...</p></div>;
+  }
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gray-100 p-4">
+      <div className="bg-white p-8 rounded-lg shadow-xl w-full max-w-xl">
+        <h1 className="text-3xl font-bold text-center text-blue-700 mb-6">Cek Nilai PAS Siswa</h1>
+        <div className="flex flex-col sm:flex-row gap-4 mb-6">
+          <input
+            type="text"
+            className="flex-grow p-3 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+            placeholder="Masukkan NISN siswa"
+            value={nisn}
+            onChange={(e) => setNisn(e.target.value)}
+            onKeyPress={(e) => { if (e.key === 'Enter') searchStudent(); }}
+          />
+          <button
+            onClick={searchStudent}
+            className="bg-blue-600 text-white p-3 rounded-md hover:bg-blue-700 transition duration-300 ease-in-out font-semibold shadow-md"
+            disabled={loading}
+          >
+            {loading ? 'Mencari...' : 'Cari Nilai'}
+          </button>
+        </div>
+        <Message text={message.text} type={message.type} />
+
+        {studentData && (
+          <div className="mt-6 p-4 border border-gray-200 rounded-md bg-gray-50">
+            <h2 className="text-xl font-semibold text-blue-600 mb-3">Detail Siswa</h2>
+            <p className="mb-1"><strong className="w-32 inline-block">NISN:</strong> {studentData.nisn}</p>
+            <p className="mb-1"><strong className="w-32 inline-block">Nama:</strong> {studentData.nama}</p>
+            <p className="mb-3"><strong className="w-32 inline-block">Kelas:</strong> {studentData.kelas}</p>
+
+            {studentData.nilai_pas && studentData.nilai_pas.length > 0 ? (
+              <>
+                <h3 className="text-lg font-semibold text-blue-500 mb-2 mt-4">Nilai PAS</h3>
+                <div className="overflow-x-auto">
+                  <table className="min-w-full bg-white border border-gray-300 rounded-lg">
+                    <thead>
+                      <tr className="bg-gray-200 text-gray-700 text-left">
+                        <th className="py-2 px-4 border-b">Mata Pelajaran</th>
+                        <th className="py-2 px-4 border-b">Nilai</th>
+                        <th className="py-2 px-4 border-b">Semester</th>
+                        <th className="py-2 px-4 border-b">Tahun Ajaran</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {studentData.nilai_pas.map((nilai, index) => (
+                        <tr key={index} className="hover:bg-gray-100">
+                          <td className="py-2 px-4 border-b">{nilai.mata_pelajaran}</td>
+                          <td className="py-2 px-4 border-b">{nilai.nilai}</td>
+                          <td className="py-2 px-4 border-b">{nilai.semester}</td>
+                          <td className="py-2 px-4 border-b">{nilai.tahun_ajaran}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            ) : (
+              <p className="text-gray-600 mt-4 italic">Belum ada nilai PAS yang tercatat untuk siswa ini.</p>
+            )}
+          </div>
+        )}
+        <div className="text-center mt-6">
+          <button
+            onClick={() => window.location.href = '#/admin/login'}
+            className="text-blue-600 hover:underline"
+          >
+            Login Admin
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// --- Komponen Halaman Login Admin ---
+const AdminLogin = ({ onLoginSuccess }) => {
+  const { auth, loadingFirebase, userId, ADMIN_UID } = useContext(AppContext);
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [message, setMessage] = useState({ text: '', type: '' });
+  const [loading, setLoading] = useState(false);
+
+  const handleLogin = async () => {
+    setMessage({ text: '', type: '' });
+    if (!username.trim() || !password.trim()) {
+      setMessage({ text: 'Username dan Password harus diisi.', type: 'error' });
+      return;
+    }
+
+    setLoading(true);
+    // Untuk demo, kita akan memverifikasi username/password statis.
+    // Di aplikasi nyata, Anda akan menggunakan Firebase Authentication (Email/Password, Google, dll.)
+    // atau sistem user di Firestore.
+    if (username === 'admin' && password === 'adminpass') {
+      if (userId === ADMIN_UID) { // Pastikan user yang login adalah user admin
+        onLoginSuccess();
+      } else {
+        setMessage({ text: `Login berhasil, namun Anda bukan Admin. UID Anda: ${userId}`, type: 'error' });
+      }
+    } else {
+      setMessage({ text: 'Username atau password salah.', type: 'error' });
+    }
+    setLoading(false);
+  };
+
+  if (loadingFirebase) {
+    return <div className="min-h-screen flex items-center justify-center bg-gray-100"><p className="text-xl font-semibold text-blue-600">Memuat Firebase...</p></div>;
+  }
+
+  // Jika sudah login dan merupakan admin, langsung arahkan ke dashboard
+  if (userId && userId === ADMIN_UID) {
+    onLoginSuccess();
+    return null; // Don't render anything while redirecting
+  }
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gray-100 p-4">
+      <div className="bg-white p-8 rounded-lg shadow-xl w-full max-w-md">
+        <h1 className="text-3xl font-bold text-center text-blue-700 mb-6">Login Admin</h1>
+        <div className="space-y-4 mb-6">
+          <div>
+            <label className="block text-gray-700 text-sm font-bold mb-2" htmlFor="username">
+              Username (demo: admin)
+            </label>
+            <input
+              className="shadow appearance-none border rounded-md w-full py-3 px-4 text-gray-700 leading-tight focus:outline-none focus:ring-2 focus:ring-blue-500"
+              id="username"
+              type="text"
+              placeholder="Username"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="block text-gray-700 text-sm font-bold mb-2" htmlFor="password">
+              Password (demo: adminpass)
+            </label>
+            <input
+              className="shadow appearance-none border rounded-md w-full py-3 px-4 text-gray-700 mb-3 leading-tight focus:outline-none focus:ring-2 focus:ring-blue-500"
+              id="password"
+              type="password"
+              placeholder="**********"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              onKeyPress={(e) => { if (e.key === 'Enter') handleLogin(); }}
+            />
+          </div>
+          <button
+            onClick={handleLogin}
+            className="bg-blue-600 text-white p-3 rounded-md w-full hover:bg-blue-700 transition duration-300 ease-in-out font-semibold shadow-md"
+            disabled={loading}
+          >
+            {loading ? 'Logging In...' : 'Login'}
+          </button>
+        </div>
+        <Message text={message.text} type={message.type} />
+        <div className="text-center mt-6">
+          <button
+            onClick={() => window.location.href = '#/'}
+            className="text-blue-600 hover:underline"
+          >
+            Kembali ke Halaman Utama
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// --- Komponen Dashboard Admin ---
+const AdminDashboard = ({ onLogout }) => {
+  const { db, userId, ADMIN_UID, loadingFirebase } = useContext(AppContext);
+  const [activeTab, setActiveTab] = useState('siswa');
+  const [message, setMessage] = useState({ text: '', type: '' });
+
+  // Data State
+  const [students, setStudents] = useState([]);
+  const [subjects, setSubjects] = useState([]);
+  const [grades, setGrades] = useState([]);
+
+  // Form States (Siswa)
+  const [newNisn, setNewNisn] = useState('');
+  const [newNamaSiswa, setNewNamaSiswa] = useState('');
+  const [newKelas, setNewKelas] = useState('');
+
+  // Form States (Mata Pelajaran)
+  const [newMapelName, setNewMapelName] = useState('');
+
+  // Form States (Input Nilai Manual)
+  const [selectedSiswaId, setSelectedSiswaId] = useState('');
+  const [selectedMapelId, setSelectedMapelId] = useState('');
+  const [manualNilai, setManualNilai] = useState('');
+  const [manualSemester, setManualSemester] = useState('');
+  const [manualTahunAjaran, setManualTahunAjaran] = useState('');
+
+  // Excel Upload State
+  const [excelFile, setExcelFile] = useState(null);
+
+  // --- Fetch Data from Firestore ---
+  useEffect(() => {
+    if (!db || userId !== ADMIN_UID) return;
+
+    // Listen to Students
+    const studentsRef = collection(db, `artifacts/${appId}/public/data/students`);
+    const unsubscribeStudents = onSnapshot(studentsRef, (snapshot) => {
+      setStudents(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    }, (error) => console.error("Error fetching students:", error));
+
+    // Listen to Subjects
+    const subjectsRef = collection(db, `artifacts/${appId}/public/data/subjects`);
+    const unsubscribeSubjects = onSnapshot(subjectsRef, (snapshot) => {
+      setSubjects(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+    }, (error) => console.error("Error fetching subjects:", error));
+
+    // Listen to Grades
+    const gradesRef = collection(db, `artifacts/${appId}/public/data/grades`);
+    const unsubscribeGrades = onSnapshot(gradesRef, async (snapshot) => {
+      const fetchedGrades = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+      // Resolve student and subject names for display
+      const gradesWithNames = await Promise.all(fetchedGrades.map(async (grade) => {
+        const siswa = students.find(s => s.id === grade.siswaId);
+        const mapel = subjects.find(m => m.id === grade.mapelId);
+        return {
+          ...grade,
+          namaSiswa: siswa ? siswa.nama : 'N/A',
+          nisnSiswa: siswa ? siswa.nisn : 'N/A',
+          namaMapel: mapel ? mapel.nama_mapel : 'N/A'
+        };
+      }));
+      setGrades(gradesWithNames);
+    }, (error) => console.error("Error fetching grades:", error));
+
+    return () => {
+      unsubscribeStudents();
+      unsubscribeSubjects();
+      unsubscribeGrades();
+    };
+  }, [db, userId, ADMIN_UID, students, subjects]); // Re-run if students/subjects arrays change for resolving names
+
+  // --- Handlers for Admin Actions ---
+
+  const showMessage = (text, type) => {
+    setMessage({ text, type });
+    setTimeout(() => setMessage({ text: '', type: '' }), 5000);
+  };
+
+  const addSiswa = async () => {
+    if (!newNisn.trim() || !newNamaSiswa.trim() || !newKelas.trim()) {
+      showMessage('NISN, Nama, dan Kelas diperlukan.', 'error');
+      return;
+    }
+    try {
+      const studentsRef = collection(db, `artifacts/${appId}/public/data/students`);
+      const q = query(studentsRef, where('nisn', '==', newNisn.trim()));
+      const querySnapshot = await getDocs(q);
+      if (!querySnapshot.empty) {
+        showMessage('NISN sudah ada.', 'error');
+        return;
+      }
+
+      await addDoc(studentsRef, {
+        nisn: newNisn.trim(),
+        nama: newNamaSiswa.trim(),
+        kelas: newKelas.trim()
+      });
+      showMessage('Siswa berhasil ditambahkan.', 'success');
+      setNewNisn('');
+      setNewNamaSiswa('');
+      setNewKelas('');
+    } catch (e) {
+      console.error("Error adding student:", e);
+      showMessage('Gagal menambahkan siswa.', 'error');
+    }
+  };
+
+  const addMataPelajaran = async () => {
+    if (!newMapelName.trim()) {
+      showMessage('Nama mata pelajaran diperlukan.', 'error');
+      return;
+    }
+    try {
+      const subjectsRef = collection(db, `artifacts/${appId}/public/data/subjects`);
+      const q = query(subjectsRef, where('nama_mapel', '==', newMapelName.trim()));
+      const querySnapshot = await getDocs(q);
+      if (!querySnapshot.empty) {
+        showMessage('Mata pelajaran sudah ada.', 'error');
+        return;
+      }
+
+      await addDoc(subjectsRef, { nama_mapel: newMapelName.trim() });
+      showMessage('Mata pelajaran berhasil ditambahkan.', 'success');
+      setNewMapelName('');
+    } catch (e) {
+      console.error("Error adding subject:", e);
+      showMessage('Gagal menambahkan mata pelajaran.', 'error');
+    }
+  };
+
+  const inputNilaiManual = async () => {
+    if (!selectedSiswaId || !selectedMapelId || !manualNilai || !manualSemester.trim() || !manualTahunAjaran.trim()) {
+      showMessage('Semua field nilai wajib diisi.', 'error');
+      return;
+    }
+    const nilai = parseFloat(manualNilai);
+    if (isNaN(nilai) || nilai < 0 || nilai > 100) {
+      showMessage('Nilai harus berupa angka antara 0 dan 100.', 'error');
+      return;
+    }
+
+    try {
+      const gradesRef = collection(db, `artifacts/${appId}/public/data/grades`);
+      // Cek apakah nilai untuk kombinasi ini sudah ada
+      const q = query(gradesRef,
+        where('siswaId', '==', selectedSiswaId),
+        where('mapelId', '==', selectedMapelId),
+        where('semester', '==', manualSemester.trim()),
+        where('tahun_ajaran', '==', manualTahunAjaran.trim())
+      );
+      const querySnapshot = await getDocs(q);
+
+      if (!querySnapshot.empty) {
+        // Perbarui nilai yang sudah ada
+        const docToUpdate = querySnapshot.docs[0];
+        await updateDoc(doc(db, `artifacts/${appId}/public/data/grades`, docToUpdate.id), { nilai: nilai });
+        showMessage('Nilai berhasil diperbarui.', 'success');
+      } else {
+        // Tambahkan nilai baru
+        await addDoc(gradesRef, {
+          siswaId: selectedSiswaId,
+          mapelId: selectedMapelId,
+          nilai: nilai,
+          semester: manualSemester.trim(),
+          tahun_ajaran: manualTahunAjaran.trim()
+        });
+        showMessage('Nilai berhasil ditambahkan.', 'success');
+      }
+      setSelectedSiswaId('');
+      setSelectedMapelId('');
+      setManualNilai('');
+      setManualSemester('');
+      setManualTahunAjaran('');
+    } catch (e) {
+      console.error("Error inputting manual grade:", e);
+      showMessage('Gagal menginput nilai manual.', 'error');
+    }
+  };
+
+  const handleExcelFileChange = (e) => {
+    setExcelFile(e.target.files[0]);
+  };
+
+  const uploadExcel = async () => {
+    if (!excelFile) {
+      showMessage('Pilih file Excel terlebih dahulu.', 'error');
+      return;
+    }
+    showMessage('Memproses file Excel...', 'info');
+
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      try {
+        const data = new Uint8Array(e.target.result);
+        const workbook = XLSX.read(data, { type: 'array' });
+        const sheetName = workbook.SheetNames[0];
+        const worksheet = workbook.Sheets[sheetName];
+        const jsonSheet = XLSX.utils.sheet_to_json(worksheet, { header: 1 }); // Read as array of arrays
+
+        if (jsonSheet.length < 2) {
+          showMessage('File Excel kosong atau tidak memiliki header.', 'error');
+          return;
+        }
+
+        const headers = jsonSheet[0];
+        const expectedHeaders = ['NISN', 'Nama Siswa', 'Kelas', 'Mata Pelajaran', 'Nilai', 'Semester', 'Tahun Ajaran'];
+        const missingHeaders = expectedHeaders.filter(h => !headers.includes(h));
+
+        if (missingHeaders.length > 0) {
+          showMessage(`Kolom yang diperlukan tidak lengkap: ${missingHeaders.join(', ')}.`, 'error');
+          return;
+        }
+
+        const dataRows = jsonSheet.slice(1); // Get data rows after header
+
+        const studentsRef = collection(db, `artifacts/${appId}/public/data/students`);
+        const subjectsRef = collection(db, `artifacts/${appId}/public/data/subjects`);
+        const gradesRef = collection(db, `artifacts/${appId}/public/data/grades`);
+
+        let successCount = 0;
+        let errorDetails = [];
+
+        // Batch writes for efficiency
+        const batch = writeBatch(db);
+
+        for (let i = 0; i < dataRows.length; i++) {
+          const row = dataRows[i];
+          const rowData = {};
+          headers.forEach((header, index) => {
+            rowData[header] = row[index];
+          });
+
+          try {
+            const nisn = String(rowData['NISN']).trim();
+            const namaSiswa = String(rowData['Nama Siswa']).trim();
+            const kelas = String(rowData['Kelas']).trim();
+            const namaMapel = String(rowData['Mata Pelajaran']).trim();
+            const nilai = parseFloat(rowData['Nilai']);
+            const semester = String(rowData['Semester']).trim();
+            const tahunAjaran = String(rowData['Tahun Ajaran']).trim();
+
+            if (!nisn || !namaSiswa || !kelas || !namaMapel || isNaN(nilai) || nilai < 0 || nilai > 100 || !semester || !tahunAjaran) {
+              throw new Error('Data tidak lengkap atau nilai tidak valid.');
+            }
+
+            // 1. Dapatkan atau tambahkan Siswa
+            let siswaDocRef;
+            const qSiswa = query(studentsRef, where('nisn', '==', nisn));
+            const siswaSnapshot = await getDocs(qSiswa);
+
+            if (!siswaSnapshot.empty) {
+              siswaDocRef = siswaSnapshot.docs[0].ref;
+            } else {
+              siswaDocRef = doc(studentsRef); // Buat ref baru untuk doc baru
+              batch.set(siswaDocRef, { nisn, nama: namaSiswa, kelas });
+            }
+
+            // 2. Dapatkan atau tambahkan Mata Pelajaran
+            let mapelDocRef;
+            const qMapel = query(subjectsRef, where('nama_mapel', '==', namaMapel));
+            const mapelSnapshot = await getDocs(qMapel);
+
+            if (!mapelSnapshot.empty) {
+              mapelDocRef = mapelSnapshot.docs[0].ref;
+            } else {
+              mapelDocRef = doc(subjectsRef); // Buat ref baru
+              batch.set(mapelDocRef, { nama_mapel: namaMapel });
+            }
+
+            // 3. Tambahkan atau perbarui Nilai PAS
+            const qNilai = query(gradesRef,
+              where('siswaId', '==', siswaDocRef.id),
+              where('mapelId', '==', mapelDocRef.id),
+              where('semester', '==', semester),
+              where('tahun_ajaran', '==', tahunAjaran)
+            );
+            const nilaiSnapshot = await getDocs(qNilai);
+
+            if (!nilaiSnapshot.empty) {
+              const nilaiDocRef = nilaiSnapshot.docs[0].ref;
+              batch.update(nilaiDocRef, { nilai: nilai });
+            } else {
+              batch.set(doc(gradesRef), {
+                siswaId: siswaDocRef.id,
+                mapelId: mapelDocRef.id,
+                nilai: nilai,
+                semester: semester,
+                tahun_ajaran: tahunAjaran
+              });
+            }
+            successCount++;
+          } catch (e) {
+            errorDetails.push(`Baris ${i + 2}: NISN ${rowData['NISN'] || 'N/A'}, Mapel ${rowData['Mata Pelajaran'] || 'N/A'} - ${e.message}`);
+          }
+        }
+
+        await batch.commit(); // Commit semua operasi batch
+        let msg = `Berhasil mengunggah ${successCount} data nilai.`;
+        if (errorDetails.length > 0) {
+          msg += ` Ada ${errorDetails.length} baris dengan kesalahan:\n${errorDetails.join('\n')}`;
+          showMessage(msg, 'error');
+        } else {
+          showMessage(msg, 'success');
+        }
+      } catch (error) {
+        console.error("Error processing Excel file:", error);
+        showMessage(`Terjadi kesalahan saat memproses file Excel: ${error.message}`, 'error');
+      }
+    };
+    reader.readAsArrayBuffer(excelFile);
+  };
+
+  const downloadExcelTemplate = () => {
+    const headers = ['NISN', 'Nama Siswa', 'Kelas', 'Mata Pelajaran', 'Nilai', 'Semester', 'Tahun Ajaran'];
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet([headers]);
+    XLSX.utils.book_append_sheet(wb, ws, "Template Nilai");
+    XLSX.writeFile(wb, "data_nilai_template.xlsx");
+  };
+
+  const exportAllGrades = () => {
+    if (grades.length === 0) {
+      showMessage('Tidak ada data nilai untuk diekspor.', 'info');
+      return;
+    }
+
+    const dataToExport = [
+      ['NISN', 'Nama Siswa', 'Kelas', 'Mata Pelajaran', 'Nilai', 'Semester', 'Tahun Ajaran']
+    ];
+    grades.forEach(grade => {
+      dataToExport.push([
+        grade.nisnSiswa,
+        grade.namaSiswa,
+        students.find(s => s.id === grade.siswaId)?.kelas || 'N/A', // Get class from students list
+        grade.namaMapel,
+        grade.nilai,
+        grade.semester,
+        grade.tahun_ajaran
+      ]);
+    });
+
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet(dataToExport);
+    XLSX.utils.book_append_sheet(wb, ws, "Data Nilai PAS");
+    XLSX.writeFile(wb, "data_nilai_pas_exported.xlsx");
+  };
+
+
+  if (loadingFirebase) {
+    return <div className="min-h-screen flex items-center justify-center bg-gray-100"><p className="text-xl font-semibold text-blue-600">Memuat Firebase...</p></div>;
+  }
+
+  if (userId !== ADMIN_UID) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gray-100 p-4">
+        <div className="bg-white p-8 rounded-lg shadow-xl w-full max-w-md text-center">
+          <p className="text-red-600 font-bold mb-4">Akses Ditolak. Anda bukan Admin.</p>
+          <p className="mb-4">UID Anda: <span className="font-mono bg-gray-200 px-2 py-1 rounded">{userId || 'Tidak diketahui'}</span></p>
+          <p className="mb-4">UID Admin (demo): <span className="font-mono bg-gray-200 px-2 py-1 rounded">{ADMIN_UID || 'Belum Diatur'}</span></p>
+          <button
+            onClick={onLogout}
+            className="bg-red-500 text-white p-3 rounded-md hover:bg-red-600 transition duration-300 ease-in-out font-semibold shadow-md"
+          >
+            Logout
+          </button>
+          <div className="mt-4">
+            <button
+              onClick={() => window.location.href = '#/'}
+              className="text-blue-600 hover:underline"
+            >
+              Kembali ke Halaman Utama
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-100 p-4">
+      <div className="bg-white p-8 rounded-lg shadow-xl w-full max-w-4xl mx-auto">
+        <div className="flex justify-between items-center mb-6">
+          <h1 className="text-3xl font-bold text-blue-700">Dashboard Admin</h1>
+          <button
+            onClick={onLogout}
+            className="bg-red-500 text-white p-2 rounded-md hover:bg-red-600 transition duration-300 ease-in-out font-semibold text-sm shadow-md"
+          >
+            Logout
+          </button>
+        </div>
+        <p className="text-gray-600 mb-4">
+          <strong className="text-gray-800">App ID:</strong> <span className="font-mono bg-gray-100 px-2 rounded-sm">{appId}</span><br />
+          <strong className="text-gray-800">User ID Anda:</strong> <span className="font-mono bg-gray-100 px-2 rounded-sm">{userId}</span><br />
+          <strong className="text-gray-800">User ID Admin (demo):</strong> <span className="font-mono bg-gray-100 px-2 rounded-sm">{ADMIN_UID}</span>
+        </p>
+
+        <div className="flex border-b border-gray-200 mb-6">
+          <button
+            className={`py-3 px-6 text-lg font-semibold ${activeTab === 'siswa' ? 'border-b-2 border-blue-600 text-blue-600' : 'text-gray-600 hover:text-blue-600'}`}
+            onClick={() => setActiveTab('siswa')}
+          >
+            Siswa & Mapel
+          </button>
+          <button
+            className={`py-3 px-6 text-lg font-semibold ${activeTab === 'nilai' ? 'border-b-2 border-blue-600 text-blue-600' : 'text-gray-600 hover:text-blue-600'}`}
+            onClick={() => setActiveTab('nilai')}
+          >
+            Input Nilai
+          </button>
+          <button
+            className={`py-3 px-6 text-lg font-semibold ${activeTab === 'excel' ? 'border-b-2 border-blue-600 text-blue-600' : 'text-gray-600 hover:text-blue-600'}`}
+            onClick={() => setActiveTab('excel')}
+          >
+            Upload/Export Excel
+          </button>
+        </div>
+
+        <Message text={message.text} type={message.type} />
+
+        {/* Tab Siswa & Mata Pelajaran */}
+        {activeTab === 'siswa' && (
+          <>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+              {/* Tambah Siswa */}
+              <div className="bg-blue-50 p-6 rounded-lg shadow-sm border border-blue-200">
+                <h2 className="text-xl font-semibold text-blue-700 mb-4">Tambah Siswa Baru</h2>
+                <div className="space-y-3">
+                  <input
+                    type="text"
+                    className="w-full p-2 border border-blue-300 rounded-md focus:ring-blue-500 focus:border-blue-500"
+                    placeholder="NISN Siswa"
+                    value={newNisn}
+                    onChange={(e) => setNewNisn(e.target.value)}
+                  />
+                  <input
+                    type="text"
+                    className="w-full p-2 border border-blue-300 rounded-md focus:ring-blue-500 focus:border-blue-500"
+                    placeholder="Nama Siswa"
+                    value={newNamaSiswa}
+                    onChange={(e) => setNewNamaSiswa(e.target.value)}
+                  />
+                  <input
+                    type="text"
+                    className="w-full p-2 border border-blue-300 rounded-md focus:ring-blue-500 focus:border-blue-500"
+                    placeholder="Kelas Siswa (ex: X-IPA 1)"
+                    value={newKelas}
+                    onChange={(e) => setNewKelas(e.target.value)}
+                  />
+                  <button
+                    onClick={addSiswa}
+                    className="w-full bg-blue-600 text-white p-2 rounded-md hover:bg-blue-700 transition duration-300 shadow-md"
+                  >
+                    Tambah Siswa
+                  </button>
+                </div>
+              </div>
+
+              {/* Tambah Mata Pelajaran */}
+              <div className="bg-green-50 p-6 rounded-lg shadow-sm border border-green-200">
+                <h2 className="text-xl font-semibold text-green-700 mb-4">Tambah Mata Pelajaran</h2>
+                <div className="space-y-3">
+                  <input
+                    type="text"
+                    className="w-full p-2 border border-green-300 rounded-md focus:ring-green-500 focus:border-green-500"
+                    placeholder="Nama Mata Pelajaran (ex: Matematika)"
+                    value={newMapelName}
+                    onChange={(e) => setNewMapelName(e.target.value)}
+                  />
+                  <button
+                    onClick={addMataPelajaran}
+                    className="w-full bg-green-600 text-white p-2 rounded-md hover:bg-green-700 transition duration-300 shadow-md"
+                  >
+                    Tambah Mata Pelajaran
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Daftar Siswa */}
+            <h2 className="text-xl font-semibold text-gray-800 mb-3 mt-8">Daftar Siswa ({students.length})</h2>
+            <div className="overflow-x-auto bg-white rounded-lg shadow-sm border border-gray-200">
+              <table className="min-w-full divide-y divide-gray-200">
+                <thead className="bg-gray-100">
+                  <tr>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">NISN</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Nama</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Kelas</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ID Firestore</th>
+                  </tr>
+                </thead>
+                <tbody className="bg-white divide-y divide-gray-200">
+                  {students.map((siswa) => (
+                    <tr key={siswa.id}>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{siswa.nisn}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{siswa.nama}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{siswa.kelas}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-xs text-gray-500 font-mono">{siswa.id}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {students.length === 0 && <p className="text-center py-4 text-gray-500 italic">Belum ada siswa.</p>}
+            </div>
+
+            {/* Daftar Mata Pelajaran */}
+            <h2 className="text-xl font-semibold text-gray-800 mb-3 mt-8">Daftar Mata Pelajaran ({subjects.length})</h2>
+            <div className="overflow-x-auto bg-white rounded-lg shadow-sm border border-gray-200">
+              <table className="min-w-full divide-y divide-gray-200">
+                <thead className="bg-gray-100">
+                  <tr>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Nama Mata Pelajaran</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ID Firestore</th>
+                  </tr>
+                </thead>
+                <tbody className="bg-white divide-y divide-gray-200">
+                  {subjects.map((mapel) => (
+                    <tr key={mapel.id}>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{mapel.nama_mapel}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-xs text-gray-500 font-mono">{mapel.id}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {subjects.length === 0 && <p className="text-center py-4 text-gray-500 italic">Belum ada mata pelajaran.</p>}
+            </div>
+          </>
+        )}
+
+        {/* Tab Input Nilai */}
+        {activeTab === 'nilai' && (
+          <>
+            <h2 className="text-xl font-semibold text-gray-800 mb-4">Input Nilai PAS Manual</h2>
+            <div className="bg-yellow-50 p-6 rounded-lg shadow-sm border border-yellow-200 mb-8">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label htmlFor="select-siswa" className="block text-sm font-medium text-gray-700 mb-1">Pilih Siswa</label>
+                  <select
+                    id="select-siswa"
+                    className="w-full p-2 border border-yellow-300 rounded-md focus:ring-yellow-500 focus:border-yellow-500"
+                    value={selectedSiswaId}
+                    onChange={(e) => setSelectedSiswaId(e.target.value)}
+                  >
+                    <option value="">Pilih Siswa (NISN - Nama)</option>
+                    {students.map(siswa => (
+                      <option key={siswa.id} value={siswa.id}>{siswa.nisn} - {siswa.nama}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label htmlFor="select-mapel" className="block text-sm font-medium text-gray-700 mb-1">Pilih Mata Pelajaran</label>
+                  <select
+                    id="select-mapel"
+                    className="w-full p-2 border border-yellow-300 rounded-md focus:ring-yellow-500 focus:border-yellow-500"
+                    value={selectedMapelId}
+                    onChange={(e) => setSelectedMapelId(e.target.value)}
+                  >
+                    <option value="">Pilih Mata Pelajaran</option>
+                    {subjects.map(mapel => (
+                      <option key={mapel.id} value={mapel.id}>{mapel.nama_mapel}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label htmlFor="manual-nilai" className="block text-sm font-medium text-gray-700 mb-1">Nilai (0-100)</label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    id="manual-nilai"
+                    className="w-full p-2 border border-yellow-300 rounded-md focus:ring-yellow-500 focus:border-yellow-500"
+                    placeholder="Nilai (ex: 85.5)"
+                    value={manualNilai}
+                    onChange={(e) => setManualNilai(e.target.value)}
+                  />
+                </div>
+                <div>
+                  <label htmlFor="semester-manual" className="block text-sm font-medium text-gray-700 mb-1">Semester</label>
+                  <input
+                    type="text"
+                    id="semester-manual"
+                    className="w-full p-2 border border-yellow-300 rounded-md focus:ring-yellow-500 focus:border-yellow-500"
+                    placeholder="Semester (ex: Ganjil)"
+                    value={manualSemester}
+                    onChange={(e) => setManualSemester(e.target.value)}
+                  />
+                </div>
+                <div>
+                  <label htmlFor="tahun-ajaran-manual" className="block text-sm font-medium text-gray-700 mb-1">Tahun Ajaran</label>
+                  <input
+                    type="text"
+                    id="tahun-ajaran-manual"
+                    className="w-full p-2 border border-yellow-300 rounded-md focus:ring-yellow-500 focus:border-yellow-500"
+                    placeholder="Tahun Ajaran (ex: 2023/2024)"
+                    value={manualTahunAjaran}
+                    onChange={(e) => setManualTahunAjaran(e.target.value)}
+                  />
+                </div>
+              </div>
+              <button
+                onClick={inputNilaiManual}
+                className="mt-6 w-full bg-yellow-600 text-white p-3 rounded-md hover:bg-yellow-700 transition duration-300 shadow-md font-semibold"
+              >
+                Input/Perbarui Nilai
+              </button>
+            </div>
+
+            {/* Daftar Semua Nilai */}
+            <h2 className="text-xl font-semibold text-gray-800 mb-3 mt-8">Daftar Semua Nilai PAS ({grades.length})</h2>
+            <div className="overflow-x-auto bg-white rounded-lg shadow-sm border border-gray-200">
+              <table className="min-w-full divide-y divide-gray-200">
+                <thead className="bg-gray-100">
+                  <tr>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">NISN</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Nama Siswa</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Mata Pelajaran</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Nilai</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Semester</th>
+                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Tahun Ajaran</th>
+                  </tr>
+                </thead>
+                <tbody className="bg-white divide-y divide-gray-200">
+                  {grades.map((grade) => (
+                    <tr key={grade.id}>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{grade.nisnSiswa}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{grade.namaSiswa}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{grade.namaMapel}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{grade.nilai}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{grade.semester}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{grade.tahun_ajaran}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {grades.length === 0 && <p className="text-center py-4 text-gray-500 italic">Belum ada nilai yang tercatat.</p>}
+            </div>
+          </>
+        )}
+
+        {/* Tab Upload/Export Excel */}
+        {activeTab === 'excel' && (
+          <>
+            <h2 className="text-xl font-semibold text-gray-800 mb-4">Upload Nilai PAS dari Excel</h2>
+            <div className="bg-purple-50 p-6 rounded-lg shadow-sm border border-purple-200 mb-8">
+              <div className="space-y-3">
+                <label htmlFor="excel-file" className="block text-sm font-medium text-gray-700">Pilih file Excel (.xlsx atau .xls):</label>
+                <input
+                  type="file"
+                  id="excel-file"
+                  accept=".xlsx, .xls"
+                  onChange={handleExcelFileChange}
+                  className="w-full text-gray-700 bg-white border border-purple-300 rounded-md p-2 file:mr-4 file:py-2 file:px-4
+                             file:rounded-md file:border-0 file:text-sm file:font-semibold
+                             file:bg-purple-100 file:text-purple-700 hover:file:bg-purple-200"
+                />
+                <button
+                  onClick={uploadExcel}
+                  className="w-full bg-purple-600 text-white p-3 rounded-md hover:bg-purple-700 transition duration-300 shadow-md font-semibold"
+                >
+                  Upload dan Proses Excel
+                </button>
+                <p className="text-sm text-gray-600">
+                  Pastikan file Excel memiliki header berikut: NISN, Nama Siswa, Kelas, Mata Pelajaran, Nilai, Semester, Tahun Ajaran.
+                </p>
+                <button
+                  onClick={downloadExcelTemplate}
+                  className="mt-2 w-full bg-indigo-500 text-white p-2 rounded-md hover:bg-indigo-600 transition duration-300 shadow-md text-sm"
+                >
+                  Unduh Template Excel
+                </button>
+              </div>
+            </div>
+
+            <h2 className="text-xl font-semibold text-gray-800 mb-4">Export Semua Nilai PAS ke Excel</h2>
+            <div className="bg-teal-50 p-6 rounded-lg shadow-sm border border-teal-200">
+              <p className="text-sm text-gray-700 mb-4">
+                Fungsi ini akan mengunduh semua data nilai yang ada di database ke file Excel.
+              </p>
+              <button
+                onClick={exportAllGrades}
+                className="w-full bg-teal-600 text-white p-3 rounded-md hover:bg-teal-700 transition duration-300 shadow-md font-semibold"
+              >
+                Export Semua Nilai
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// --- Main App Component ---
+const App = () => {
+  const [route, setRoute] = useState(window.location.hash || '#/');
+
+  useEffect(() => {
+    const handleHashChange = () => {
+      setRoute(window.location.hash);
+    };
+    window.addEventListener('hashchange', handleHashChange);
+    return () => window.removeEventListener('hashchange', handleHashChange);
+  }, []);
+
+  const renderContent = () => {
+    switch (route) {
+      case '#/admin/login':
+        return <AdminLogin onLoginSuccess={() => window.location.hash = '#/admin/dashboard'} />;
+      case '#/admin/dashboard':
+        return <AdminDashboard onLogout={() => {
+          getAuth().signOut(); // Sign out from Firebase
+          window.location.hash = '#/';
+        }} />;
+      case '#/':
+      default:
+        return <StudentView />;
+    }
+  };
+
+  return (
+    <div className="font-sans antialiased text-gray-900 bg-gray-100">
+      <style>{`
+        /* Tailwind CSS CDN */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        input[type="file"]::file-selector-button {
+            cursor: pointer;
+        }
+      `}</style>
+      <AppProvider>
+        {renderContent()}
+      </AppProvider>
+    </div>
+  );
+};
+
+export default App;
